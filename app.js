@@ -1,107 +1,100 @@
 const express = require('express');
-const multer = require('multer');
 const path = require('path');
 const faceapi = require('face-api.js');
 const canvas = require('canvas');
+const fs = require('fs');
+const mongoose = require('mongoose');
+const dotenv = require('dotenv');
+
+dotenv.config();
+
+// Routes
+const faceRoutes = require('./routes/faceRoutes');
+const trainingRoutes = require('./routes/trainingRoutes');
+
+// Models
+const FaceModel = require('./models/FaceModel');
+
+// Controllers
+const { setFaceMatcher: setFaceMatcherFace } = require('./controllers/faceController');
+const { setFaceMatcher: setFaceMatcherTraining, trainedData } = require('./controllers/trainingController');
 
 const app = express();
 const port = 3000;
 
-// Cấu hình lưu trữ file upload
-const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+// Kết nối tới MongoDB
+mongoose.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true
+})
+    .then(() => console.log('MongoDB connected'))
+    .catch((err) => console.error('MongoDB connection error:', err));
 
-// Kết nối canvas của face-api.js với Node.js
+// Cấu hình Canvas cho FaceAPI
 faceapi.env.monkeyPatch({ Canvas: canvas.Canvas, Image: canvas.Image, ImageData: canvas.ImageData });
 
-// Đường dẫn đến mô hình và dữ liệu huấn luyện
+// Đường dẫn mô hình và dữ liệu
 const modelsPath = path.join(__dirname, 'models');
-const trainingDataPath = path.join(__dirname, 'data');
-app.get('/', (req, res) => {
-    res.send('Chào mừng bạn đến với API Express cơ bản!');
-});
 
-// Route lấy thông tin người dùng
-app.get('/users', (req, res) => {
-    const users = [
-        { id: 1, name: 'Nguyen Van A' },
-        { id: 2, name: 'Le Thi B' },
-    ];
-    res.json(users);
-});
-
-// Load dữ liệu huấn luyện và mô hình nhận diện khuôn mặt
-async function loadTrainingData() {
-  const labels = ["Fukada Eimi", "Rina Ishihara", "Takizawa Laura", "Yua Mikami"];
-  const faceDescriptors = [];
-  for (const label of labels) {
-    const descriptors = [];
-    for (let i = 1; i <= 4; i++) {
-      const imagePath = path.join(trainingDataPath, label, `${i}.jpeg`);
-      const image = await canvas.loadImage(imagePath);
-      const detection = await faceapi.detectSingleFace(image).withFaceLandmarks().withFaceDescriptor();
-      if (detection) {
-        descriptors.push(detection.descriptor);
-      }
+// Hàm tải dữ liệu huấn luyện từ MongoDB
+const loadTrainingDataFromDB = async () => {
+    try {
+        const faces = await FaceModel.find();
+        return faces.map((face) => {
+            const descriptors = face.descriptors.map((desc) => new Float32Array(desc));
+            return new faceapi.LabeledFaceDescriptors(face.label, descriptors);
+        });
+    } catch (err) {
+        console.error('Lỗi khi tải dữ liệu từ MongoDB:', err);
+        return [];
     }
-    faceDescriptors.push(new faceapi.LabeledFaceDescriptors(label, descriptors));
-  }
-  return faceDescriptors;
+};
+
+// Hàm tải các mô hình nhận diện
+async function initModels() {
+    try {
+        await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelsPath);
+        await faceapi.nets.faceRecognitionNet.loadFromDisk(modelsPath);
+        await faceapi.nets.faceLandmark68Net.loadFromDisk(modelsPath);
+        console.log('Mô hình nhận diện đã được tải xong.');
+    } catch (err) {
+        console.error('Lỗi khi tải các mô hình nhận diện:', err);
+    }
 }
 
-// Khởi tạo mô hình nhận diện khuôn mặt
-let faceMatcher;
+// Hàm khởi tạo ứng dụng
 async function init() {
-  await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelsPath);
-  await faceapi.nets.faceRecognitionNet.loadFromDisk(modelsPath);
-  await faceapi.nets.faceLandmark68Net.loadFromDisk(modelsPath);
+    await initModels();
 
-  const trainingData = await loadTrainingData();
-  faceMatcher = new faceapi.FaceMatcher(trainingData, 0.6);
-  console.log('Mô hình nhận diện đã được tải xong.');
+    // Lấy dữ liệu từ MongoDB
+    const faceDescriptorsFromDB = await loadTrainingDataFromDB();
+
+    if (faceDescriptorsFromDB.length === 0) {
+        console.warn('Không có dữ liệu huấn luyện trong MongoDB.');
+    }
+
+    // Gán dữ liệu đã huấn luyện
+    trainedData.splice(0, trainedData.length, ...faceDescriptorsFromDB);
+    console.log('Dữ liệu huấn luyện đã được tải:', trainedData);
+
+    // Tạo FaceMatcher nếu có dữ liệu
+    if (trainedData.length > 0) {
+        const faceMatcher = new faceapi.FaceMatcher(trainedData, 0.6);
+        setFaceMatcherFace(faceMatcher);
+        setFaceMatcherTraining(faceMatcher);
+        console.log('FaceMatcher đã được khởi tạo.');
+    } else {
+        console.warn('FaceMatcher không được khởi tạo do thiếu dữ liệu.');
+    }
 }
 
+// Khởi chạy ứng dụng
 init();
 
-// API xác thực khuôn mặt
-app.post('/verify-face', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).send('Không có file ảnh được tải lên!');
-    }
+// Routes
+app.use('/api/face', faceRoutes);
+app.use('/api/training', trainingRoutes);
 
-    // Sử dụng canvas.loadImage để tải hình ảnh từ buffer
-    const image = await canvas.loadImage(req.file.buffer);
-    const detections = await faceapi.detectAllFaces(image).withFaceLandmarks().withFaceDescriptors();
-
-    if (!detections.length) {
-      return res.status(404).send('Không tìm thấy khuôn mặt nào!');
-    }
-
-    // Vẽ hộp và xác thực khuôn mặt
-    const canvasResult = canvas.createCanvas(image.width, image.height);
-    const ctx = canvasResult.getContext('2d');
-    ctx.drawImage(image, 0, 0);
-
-    for (const detection of detections) {
-      const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
-      const drawBox = new faceapi.draw.DrawBox(detection.detection.box, {
-        label: `${bestMatch.toString()}`
-      });
-      drawBox.draw(canvasResult);
-    }
-
-    // Chuyển đổi canvas thành ảnh và trả về cho client
-    const resultImage = canvasResult.toBuffer('image/jpeg');
-    res.set('Content-Type', 'image/jpeg');
-    res.send(resultImage);
-  } catch (err) {
-    console.error('Lỗi trong quá trình xác thực khuôn mặt:', err);
-    res.status(500).send('Đã xảy ra lỗi trong quá trình xử lý.');
-  }
-});
-
-// Khởi động server
+// Lắng nghe server
 app.listen(port, () => {
-  console.log(`Server đang chạy tại http://localhost:${port}`);
+    console.log(`Server đang chạy tại http://localhost:${port}`);
 });
